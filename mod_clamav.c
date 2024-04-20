@@ -491,14 +491,14 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
   }
 
   c = find_config(CURRENT_CONF, CONF_PARAM, "ClamAV", FALSE);
-  if (!c || !*(int *)(c->argv[0])) {
+  if (!c || !*(unsigned char *)(c->argv[0])) {
     (void) pr_trace_msg("clamav", 8, "skipping ClamAV virus scan.");
 
     return 0;
   }
 
   c = find_config(CURRENT_CONF, CONF_PARAM, "ClamFailsafe", FALSE);
-  if (!c || *(int *)(c->argv[0]))
+  if (!c || *(unsigned char *)(c->argv[0]))
     remove_on_failure = 1;
   else
     remove_on_failure = 0;
@@ -569,7 +569,7 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
 
   clam_errno = 0;
   c = find_config(CURRENT_CONF, CONF_PARAM, "ClamStream", FALSE);
-  if (c && *(int *)(c->argv[0])) {
+  if (c && *(unsigned char *)(c->argv[0])) {
     res = clamavd_scan_stream(clamd_sockd, abs_path, rel_path);
   } else {
     res = clamavd_scan(clamd_sockd, abs_path, rel_path);
