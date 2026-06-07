@@ -29,7 +29,12 @@
  */
 #include "conf.h"
 #include "privs.h"
+#include <fcntl.h>
 #include <libgen.h>
+#include <netdb.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include "mod_clamav.h"
 
@@ -37,6 +42,8 @@
  * Module version and declaration
  */
 #define MOD_CLAMAV_VERSION "mod_clamav/0.14rc2"
+#define CLAMAV_CONNECT_TIMEOUT_SECS 10
+#define CLAMAV_IO_TIMEOUT_SECS 30
 module clamav_module;
 
 /**
@@ -45,7 +52,7 @@ module clamav_module;
 static int clamd_sockd = 0, is_remote = 0;
 static char *clamd_host = NULL;
 static int clamd_port = 0;
-static unsigned long long clamd_minsize = 0, clamd_maxsize = 0;
+static unsigned long clamd_minsize = 0, clamd_maxsize = 0;
 static int clam_errno;
 static int remove_on_failure = 0;
 static const char *trace_channel = "clamav";
@@ -59,6 +66,11 @@ static int clamavd_connect_check(int sockd);
 static int clamavd_scan(int sockd, const char *abs_filename, const char *rel_filename);
 static int clamavd_connect(void);
 static int write_all(int fd, const void *buf, size_t len);
+static int set_socket_io_timeout(int sockd);
+static int connect_with_timeout(int sockd, const struct sockaddr *sa,
+  socklen_t sa_len, int timeout_secs);
+static int clamav_path_is_hiddenstore(const char *path);
+static int clamav_hiddenstores_enabled(void);
 
 static int write_all(int fd, const void *buf, size_t len) {
   const unsigned char *ptr = (const unsigned char *) buf;
@@ -81,12 +93,123 @@ static int write_all(int fd, const void *buf, size_t len) {
   return 0;
 }
 
+static int set_socket_io_timeout(int sockd) {
+  struct timeval tv;
+
+  tv.tv_sec = CLAMAV_IO_TIMEOUT_SECS;
+  tv.tv_usec = 0;
+
+  if (setsockopt(sockd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+    return -1;
+  }
+
+  if (setsockopt(sockd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static int connect_with_timeout(int sockd, const struct sockaddr *sa,
+    socklen_t sa_len, int timeout_secs) {
+  fd_set wfds;
+  struct timeval tv;
+  int flags, res, xerrno, so_error;
+  socklen_t so_error_len;
+
+  flags = fcntl(sockd, F_GETFL);
+  if (flags < 0) {
+    return -1;
+  }
+
+  if (fcntl(sockd, F_SETFL, flags|O_NONBLOCK) < 0) {
+    return -1;
+  }
+
+  do {
+    res = connect(sockd, sa, sa_len);
+  } while (res < 0 && errno == EINTR);
+
+  if (res < 0 && errno == EINPROGRESS) {
+    do {
+      FD_ZERO(&wfds);
+      FD_SET(sockd, &wfds);
+      tv.tv_sec = timeout_secs;
+      tv.tv_usec = 0;
+      res = select(sockd + 1, NULL, &wfds, NULL, &tv);
+    } while (res < 0 && errno == EINTR);
+
+    if (res == 0) {
+      errno = ETIMEDOUT;
+      res = -1;
+
+    } else if (res > 0) {
+      so_error = 0;
+      so_error_len = sizeof(so_error);
+      if (getsockopt(sockd, SOL_SOCKET, SO_ERROR, &so_error,
+          &so_error_len) < 0) {
+        res = -1;
+      } else if (so_error != 0) {
+        errno = so_error;
+        res = -1;
+      } else {
+        res = 0;
+      }
+    }
+  }
+
+  xerrno = errno;
+  if (fcntl(sockd, F_SETFL, flags) < 0 && res == 0) {
+    xerrno = errno;
+    res = -1;
+  }
+
+  if (res < 0) {
+    errno = xerrno;
+  }
+
+  return res;
+}
+
+static int clamav_path_is_hiddenstore(const char *path) {
+  const char *basename;
+
+  if (path == NULL || *path == '\0') {
+    return FALSE;
+  }
+
+  basename = strrchr(path, '/');
+  if (basename != NULL) {
+    basename++;
+  } else {
+    basename = path;
+  }
+
+  if (strncmp(basename, ".in.", 4) == 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+static int clamav_hiddenstores_enabled(void) {
+  config_rec *c;
+
+  c = find_config(CURRENT_CONF, CONF_PARAM, "HiddenStores", FALSE);
+  if (c != NULL && *((unsigned char *) c->argv[0])) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
 /**
  * Read the returned information from Clamavd.
  */
 static int clamavd_result(int sockd, const char *abs_filename, const char *rel_filename) {
   int infected = 0, waserror = 0, ret, fxerrno = 0;
   char buff[4096], *pt, *pt1;
+  char *resptr = NULL;
   FILE *fd = 0;
   int fddup = -1;
 
@@ -113,11 +236,26 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
   do {
     errno = 0;
     pr_signals_handle();
-    fgets(buff, sizeof(buff) - 1, fd);
+    resptr = fgets(buff, sizeof(buff) - 1, fd);
     fxerrno = errno;
-  } while (fxerrno == EINTR);
+  } while (resptr == NULL && fxerrno == EINTR);
+
+  if (resptr == NULL) {
+    if (fxerrno == 0) {
+      fxerrno = EIO;
+    }
+
+    pr_log_pri(PR_LOG_ERR,
+               MOD_CLAMAV_VERSION ": error: failed reading scan result for '%s': %s",
+               abs_filename, strerror(fxerrno));
+    clam_errno = fxerrno;
+    fclose(fd);
+    return -1;
+  }
+
   if (strstr(buff, "FOUND\n")) {
     const char *proto;
+    int do_unlink = TRUE;
 
     ++infected;
 
@@ -125,11 +263,24 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     if (pt)
       *pt = 0;
 
-    /* Delete the infected upload */
-    /* TODO: delete only the hiddenstore file, not
-       the actual file.
-    */
-    if ((ret=pr_fsio_unlink(rel_filename))!=0) {
+    /* Never delete the destination file for APPE. */
+    if (session.curr_cmd != NULL &&
+        strcmp(session.curr_cmd, C_APPE) == 0) {
+      do_unlink = FALSE;
+    }
+
+    /* In HiddenStores mode, only delete hidden-store paths. */
+    if (do_unlink &&
+        clamav_hiddenstores_enabled() &&
+        !clamav_path_is_hiddenstore(rel_filename)) {
+      pr_log_pri(PR_LOG_WARNING,
+                 MOD_CLAMAV_VERSION ": warning: infected file path '%s' does not look like a HiddenStores path; skipping auto-delete",
+                 rel_filename);
+      do_unlink = FALSE;
+    }
+
+    if (do_unlink &&
+        (ret = pr_fsio_unlink(rel_filename)) != 0) {
       pr_log_pri(PR_LOG_ERR,
                  MOD_CLAMAV_VERSION ": notice: unlink() failed (%d): %s",
                  errno, strerror(errno));
@@ -193,13 +344,25 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
 static int clamavd_connect_check(int sockd) {
   FILE *fd = NULL;
   int fddup = -1;
+  int xerrno = 0;
   char buff[32];
+  char *resptr = NULL;
 
   (void) pr_trace_msg("clamav", 6, "clamavd_connect_check (sockd %d)",
                       sockd);
 
   if (sockd == -1)
     return 0;
+
+  if (set_socket_io_timeout(sockd) < 0) {
+    xerrno = errno;
+    pr_log_debug(DEBUG4, MOD_CLAMAV_VERSION ": Clamd socket timeout setup failed (%d): %s",
+                 xerrno, strerror(xerrno));
+    close(sockd);
+    clamd_sockd = -1;
+    clam_errno = xerrno;
+    return 0;
+  }
 
   if (write_all(sockd, "PING\n", 5) < 0) {
     pr_log_debug(DEBUG4, MOD_CLAMAV_VERSION ": Clamd did not accept PING (%d): %s",
@@ -230,7 +393,14 @@ static int clamavd_connect_check(int sockd) {
     return 0;
   }
 
-  if (fgets(buff, sizeof(buff), fd)) {
+  memset(buff, '\0', sizeof(buff));
+  do {
+    errno = 0;
+    resptr = fgets(buff, sizeof(buff), fd);
+    xerrno = errno;
+  } while (resptr == NULL && xerrno == EINTR);
+
+  if (resptr != NULL) {
     if (strstr(buff, "PONG")) {
       fclose(fd);
       return 1;
@@ -238,12 +408,16 @@ static int clamavd_connect_check(int sockd) {
     pr_log_debug(DEBUG4, MOD_CLAMAV_VERSION ": Clamd return unknown response to PING: '%s'", buff);
   }
 
-  pr_log_debug(DEBUG4, MOD_CLAMAV_VERSION ": Clamd did not respond to fgets (%d): %s",
-               errno, strerror(errno));
+  if (xerrno == 0) {
+    xerrno = EIO;
+  }
+
+  pr_log_debug(DEBUG4, MOD_CLAMAV_VERSION ": Clamd did not respond to PING (%d): %s",
+               xerrno, strerror(xerrno));
   fclose(fd);
   close(sockd);
   clamd_sockd = -1;
-  clam_errno = errno;
+  clam_errno = xerrno;
   return 0;
 }
 
@@ -353,8 +527,18 @@ static int clamavd_scan_stream(int sockd, const char *abs_filename,
 static int clamavd_scan(int sockd, const char *abs_filename,
                         const char *rel_filename) {
   char *scancmd = NULL;
+  size_t cmdlen;
 
-  scancmd = calloc(strlen(abs_filename) + 20, sizeof(char));
+  if (strpbrk(abs_filename, "\r\n") != NULL) {
+    pr_log_pri(PR_LOG_ERR,
+               MOD_CLAMAV_VERSION ": error: invalid scan path '%s'",
+               abs_filename);
+    clam_errno = EINVAL;
+    return -1;
+  }
+
+  cmdlen = strlen(abs_filename) + sizeof("SCAN \n");
+  scancmd = calloc(cmdlen, sizeof(char));
   if (!scancmd) {
     pr_log_pri(PR_LOG_ERR, MOD_CLAMAV_VERSION ": error: Cannot allocate memory.");
     return -1;
@@ -363,7 +547,7 @@ static int clamavd_scan(int sockd, const char *abs_filename,
   (void) pr_trace_msg("clamav", 6, "abs_filename '%s' being scanned.",
                       abs_filename);
 
-  sprintf(scancmd, "SCAN %s\n", abs_filename);
+  snprintf(scancmd, cmdlen, "SCAN %s\n", abs_filename);
 
   if (!clamavd_connect_check(sockd)) {
     if ((clamd_sockd = clamavd_connect()) < 0) {
@@ -401,9 +585,11 @@ static int clamavd_scan(int sockd, const char *abs_filename,
  */
 static int clamavd_connect(void) {
   struct sockaddr_un server;
-  struct sockaddr_in server2;
-  struct hostent *he;
+  struct addrinfo hints, *res = NULL, *ai;
   int sockd, *port;
+  int xerrno = 0;
+  int gai_res;
+  char portbuf[16];
 
   /**
    * We will set the global socket to non-connected, just in-case.
@@ -411,7 +597,6 @@ static int clamavd_connect(void) {
   clamd_sockd = -1;
 
   memset((char*)&server, 0, sizeof(server));
-  memset((char*)&server2, 0, sizeof(server2));
 
   clamd_host = (char *) get_param_ptr(CURRENT_CONF, "ClamLocalSocket", TRUE);
   if (!clamd_host) {
@@ -449,7 +634,8 @@ static int clamavd_connect(void) {
       return -1;
     }
 
-    if (connect(sockd, (struct sockaddr *)&server, sizeof(struct sockaddr_un)) < 0) {
+    if (connect_with_timeout(sockd, (struct sockaddr *) &server,
+        sizeof(struct sockaddr_un), CLAMAV_CONNECT_TIMEOUT_SECS) < 0) {
       close(sockd);
       PRIVS_RELINQUISH;
       pr_log_pri(PR_LOG_ERR,
@@ -459,36 +645,65 @@ static int clamavd_connect(void) {
     }
   } else {
     /* Remote Socket */
-    server2.sin_family = AF_INET;
-    server2.sin_port = htons(clamd_port);
+    memset(&hints, '\0', sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-    if ((sockd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    snprintf(portbuf, sizeof(portbuf), "%d", clamd_port);
+
+    gai_res = getaddrinfo(clamd_host, portbuf, &hints, &res);
+    if (gai_res != 0) {
       PRIVS_RELINQUISH;
       pr_log_pri(PR_LOG_ERR,
-                 MOD_CLAMAV_VERSION ": error: Cannot create socket connection Clamd (%d): %s",
-                 errno, strerror(errno));
-      clam_errno = errno;
+                 MOD_CLAMAV_VERSION ": error: Cannot resolve hostname '%s': %s",
+                 clamd_host, gai_strerror(gai_res));
+      clam_errno = EHOSTUNREACH;
       return -1;
     }
 
-    if ((he = gethostbyname(clamd_host)) == 0) {
-      close(sockd);
-      PRIVS_RELINQUISH;
-      pr_log_pri(PR_LOG_ERR, MOD_CLAMAV_VERSION ": error: Cannot resolve hostname '%s'", clamd_host);
-      clam_errno = errno;
-      return -1;
-    }
-    server2.sin_addr = *(struct in_addr *) he->h_addr_list[0];
+    sockd = -1;
+    for (ai = res; ai != NULL; ai = ai->ai_next) {
+      sockd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+      if (sockd < 0) {
+        xerrno = errno;
+        continue;
+      }
 
-    if (connect(sockd, (struct sockaddr *)&server2, sizeof(struct sockaddr_in)) < 0) {
+      if (connect_with_timeout(sockd, ai->ai_addr, ai->ai_addrlen,
+          CLAMAV_CONNECT_TIMEOUT_SECS) == 0) {
+        break;
+      }
+
+      xerrno = errno;
       close(sockd);
+      sockd = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (sockd < 0) {
       PRIVS_RELINQUISH;
+      if (xerrno == 0) {
+        xerrno = ETIMEDOUT;
+      }
+
       pr_log_pri(PR_LOG_ERR,
                  MOD_CLAMAV_VERSION ": error: Cannot connect to Clamd (%d): %s",
-                 errno, strerror(errno));
-      clam_errno = errno;
+                 xerrno, strerror(xerrno));
+      clam_errno = xerrno;
       return -1;
     }
+  }
+
+  if (set_socket_io_timeout(sockd) < 0) {
+    xerrno = errno;
+    close(sockd);
+    PRIVS_RELINQUISH;
+    pr_log_pri(PR_LOG_ERR,
+               MOD_CLAMAV_VERSION ": error: Cannot set Clamd socket timeouts (%d): %s",
+               xerrno, strerror(xerrno));
+    clam_errno = xerrno;
+    return -1;
   }
 
   PRIVS_RELINQUISH;
@@ -559,7 +774,7 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
   }
 
   c = find_config(CURRENT_CONF, CONF_PARAM, "ClamFailsafe", FALSE);
-  if (!c || *(unsigned char *)(c->argv[0]))
+  if (c && *(unsigned char *)(c->argv[0]))
     remove_on_failure = 1;
   else
     remove_on_failure = 0;
@@ -567,32 +782,20 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
   (void) pr_trace_msg("clamav", 8, "fail-safe mode is %s.",
                       (remove_on_failure ? "ON" : "OFF"));
 
-  /**
-   * Figure out the absolute path of our directory.
-   */
-  char buf[PR_TUNABLE_PATH_MAX + 1];
-  if (getcwd(buf, PR_TUNABLE_PATH_MAX) == NULL) {
-    pr_trace_msg(trace_channel, 9, "getcwd() error: %s", strerror(errno));
-    buf[0] = '\0';
-  }
-  abs_path = fh->fh_path;
-  if (abs_path && buf[0] != '\0') {
-    (void) pr_trace_msg("clamav", 8, "vwd=%s fh_path=%s chroot=%s cwd=%s buf=%s",
-                        pr_fs_getvwd(), abs_path, session.chroot_path, pr_fs_getcwd(),
-                        buf);
-    if (strcmp(buf, pr_fs_getcwd()) != 0) {
-      if (strcmp(pr_fs_getcwd(), "/") != 0) {
-        char *pos = strstr(buf, pr_fs_getcwd());
-        if (pos) {
-          *pos = 0;
-        }
-      }
-
-      abs_path = pdircat(fh->fh_pool, buf, abs_path, NULL);
-    } else if (strcmp(buf, pr_fs_getcwd()) == 0 && session.chroot_path)
-      abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
-  }
   rel_path = pstrdup(fh->fh_pool, fh->fh_path);
+  abs_path = rel_path;
+  if (abs_path != NULL) {
+    if (*abs_path != '/') {
+      abs_path = pdircat(fh->fh_pool, pr_fs_getcwd(), abs_path, NULL);
+    }
+
+    if (session.chroot_path != NULL &&
+        strcmp(session.chroot_path, "/") != 0 &&
+        strncmp(abs_path, session.chroot_path,
+          strlen(session.chroot_path)) != 0) {
+      abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
+    }
+  }
 
   (void) pr_trace_msg("clamav", 6, "absolute path is '%s' and relative path is '%s'.", abs_path, rel_path);
 
@@ -831,13 +1034,24 @@ MODRET set_clamavd_server(cmd_rec *cmd) {
  */
 MODRET set_clamavd_port(cmd_rec *cmd) {
   config_rec *c = NULL;
+  char *endp = NULL;
+  long port;
 
   CHECK_ARGS(cmd, 1);
   CHECK_CONF(cmd, CONF_ROOT|CONF_VIRTUAL|CONF_GLOBAL|CONF_DIR);
 
+  errno = 0;
+  port = strtol(cmd->argv[1], &endp, 10);
+  if (errno == ERANGE ||
+      endp == cmd->argv[1] ||
+      (endp != NULL && *endp != '\0') ||
+      port <= 0 || port > 65535) {
+    CONF_ERROR(cmd, "port must be an integer between 1 and 65535");
+  }
+
   c = add_config_param(cmd->argv[0], 1, NULL);
   c->argv[0] = pcalloc(c->pool, sizeof(int));
-  *((int *) c->argv[0]) = (int) atol(cmd->argv[1]);
+  *((int *) c->argv[0]) = (int) port;
   c->flags |= CF_MERGEDOWN;
 
   return PR_HANDLED(cmd);
