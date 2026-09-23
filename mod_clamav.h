@@ -30,13 +30,7 @@
 #if !defined(MOD_CLAMAV_H)
 #define MOD_CLAMAV_H
 
-/**
- * Function declarations
- */
-static int clamavd_result(int sockd, const char *abs_filename, const char *rel_filename);
-static int clamavd_connect_check(int sockd);
-static int clamavd_scan(int sockd, const char *abs_filename, const char *rel_filename);
-static int clamavd_connect(void);
-int clamav_scan(cmd_rec *cmd);
+/* All function prototypes are file-local to mod_clamav.c; this header
+ * exists only to provide an include guard for the module. */
 
 #endif
