@@ -53,7 +53,7 @@ module clamav_module;
 static int clamd_sockd = 0, is_remote = 0;
 static char *clamd_host = NULL;
 static int clamd_port = 0;
-static unsigned long clamd_minsize = 0, clamd_maxsize = 0;
+static pr_off_t clamd_minsize = 0, clamd_maxsize = 0;
 static int clam_errno;
 static int remove_on_failure = 0;
 static const char *trace_channel = "clamav";
