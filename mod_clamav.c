@@ -521,6 +521,7 @@ static int clamavd_scan_stream(int sockd, const char *abs_filename,
   if (!buf) {
     pr_log_pri(PR_LOG_CRIT, "Out of memory!");
     pr_session_end(1);
+    return -1;
   }
 
   /* send file contents using protocol defined by Clamd */
@@ -569,6 +570,8 @@ static int clamavd_scan_stream(int sockd, const char *abs_filename,
   if (write_all(sockd, "\n", 1) < 0) {
     pr_log_pri(PR_LOG_ERR,
                MOD_CLAMAV_VERSION ": Cannot write terminating return. %d", errno);
+    clam_errno = errno;
+    return -1;
   }
 
   /* interpret results */
