@@ -959,8 +959,8 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
 static unsigned long parse_nbytes(char *nbytes_str, char *units_str) {
   long res;
   unsigned long nbytes;
+  unsigned long units_mult = 0;
   char *endp = NULL;
-  double units_factor = 0.0;
 
   /* clear any previous local errors */
   clam_errno = 0;
@@ -968,16 +968,16 @@ static unsigned long parse_nbytes(char *nbytes_str, char *units_str) {
   /* first, check the given units to determine the correct multiplier
    */
   if (!strcasecmp("Gb", units_str)) {
-    units_factor = 1024.0 * 1024.0 * 1024.0;
+    units_mult = 1024UL * 1024UL * 1024UL;
 
   } else if (!strcasecmp("Mb", units_str)) {
-    units_factor = 1024.0 * 1024.0;
+    units_mult = 1024UL * 1024UL;
 
   } else if (!strcasecmp("Kb", units_str)) {
-    units_factor = 1024.0;
+    units_mult = 1024UL;
 
   } else if (!strcasecmp("b", units_str)) {
-    units_factor = 1.0;
+    units_mult = 1UL;
 
   } else {
     clam_errno = EINVAL;
@@ -985,7 +985,7 @@ static unsigned long parse_nbytes(char *nbytes_str, char *units_str) {
   }
 
   /* make sure a number was given */
-  if (!isdigit((int) *nbytes_str)) {
+  if (!isdigit((unsigned char) *nbytes_str)) {
     clam_errno = EINVAL;
     return 0;
   }
@@ -1011,15 +1011,13 @@ static unsigned long parse_nbytes(char *nbytes_str, char *units_str) {
     return 0;
   }
 
-  /* don't bother to apply the factor if that will cause the number to
-   * overflow
-   */
-  if ((double) res > ((double) ULONG_MAX / units_factor)) {
+  /* don't apply the factor if that would overflow (integer-exact check) */
+  if ((unsigned long) res > ULONG_MAX / units_mult) {
     clam_errno = ERANGE;
     return 0;
   }
 
-  nbytes = (unsigned long) res * units_factor;
+  nbytes = (unsigned long) res * units_mult;
   return nbytes;
 }
 
