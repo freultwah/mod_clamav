@@ -71,6 +71,7 @@ static int connect_with_timeout(int sockd, const struct sockaddr *sa,
   socklen_t sa_len, int timeout_secs);
 static int clamav_path_is_hiddenstore(const char *path);
 static int clamav_hiddenstores_enabled(void);
+static char *clamav_read_response_line(FILE *fd);
 
 static int write_all(int fd, const void *buf, size_t len) {
   const unsigned char *ptr = (const unsigned char *) buf;
@@ -204,12 +205,69 @@ static int clamav_hiddenstores_enabled(void) {
 }
 
 /**
+ * Read a full response line from Clamavd, growing the buffer as needed so
+ * that long lines (e.g. a SCAN response echoing a long file path) are not
+ * truncated. Returns a NUL-terminated malloc'ed string, or NULL on error
+ * (with errno set).
+ */
+static char *clamav_read_response_line(FILE *fd) {
+  size_t cap = 4096, len = 0;
+  char *buf;
+
+  buf = malloc(cap);
+  if (buf == NULL) {
+    return NULL;
+  }
+
+  for (;;) {
+    char *resptr;
+    int fxerrno;
+
+    if (cap - len < 2) {
+      char *nb;
+
+      cap *= 2;
+      nb = realloc(buf, cap);
+      if (nb == NULL) {
+        free(buf);
+        return NULL;
+      }
+      buf = nb;
+    }
+
+    errno = 0;
+    pr_signals_handle();
+    resptr = fgets(buf + len, (int) (cap - len), fd);
+    fxerrno = errno;
+
+    if (resptr == NULL) {
+      if (fxerrno == EINTR) {
+        continue;
+      }
+      if (len == 0) {
+        free(buf);
+        errno = (fxerrno == 0) ? EIO : fxerrno;
+        return NULL;
+      }
+      break;
+    }
+
+    len += strlen(resptr);
+    if (buf[len - 1] == '\n') {
+      break;
+    }
+  }
+
+  buf[len] = '\0';
+  return buf;
+}
+
+/**
  * Read the returned information from Clamavd.
  */
 static int clamavd_result(int sockd, const char *abs_filename, const char *rel_filename) {
-  int infected = 0, waserror = 0, ret, fxerrno = 0;
-  char buff[4096], *pt, *pt1;
-  char *resptr = NULL;
+  int infected = 0, waserror = 0, ret;
+  char *line = NULL, *pt, *pt1;
   FILE *fd = 0;
   int fddup = -1;
 
@@ -231,16 +289,10 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     return -1;
   }
 
-  memset(buff, '\0', sizeof(buff));
-  // Try to read in a loop in case fgets gets interrupted
-  do {
-    errno = 0;
-    pr_signals_handle();
-    resptr = fgets(buff, sizeof(buff) - 1, fd);
-    fxerrno = errno;
-  } while (resptr == NULL && fxerrno == EINTR);
+  line = clamav_read_response_line(fd);
+  if (line == NULL) {
+    int fxerrno = errno;
 
-  if (resptr == NULL) {
     if (fxerrno == 0) {
       fxerrno = EIO;
     }
@@ -253,13 +305,13 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     return -1;
   }
 
-  if (strstr(buff, "FOUND\n")) {
+  if (strstr(line, "FOUND\n")) {
     const char *proto;
     int do_unlink = TRUE;
 
     ++infected;
 
-    pt = strrchr(buff, ':');
+    pt = strrchr(line, ':');
     if (pt)
       *pt = 0;
 
@@ -290,7 +342,7 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     if (pt) {
       pt += 2;
     } else {
-      pt = buff;
+      pt = line;
     }
     pt1 = strstr(pt, " FOUND");
     if (pt1) {
@@ -316,9 +368,9 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     /* Log the fact */
     pr_log_pri(PR_LOG_ERR,
                MOD_CLAMAV_VERSION ": Virus '%s' found in '%s'", pt, abs_filename);
-  } else if (strstr(buff, "ERROR\n") != NULL ||
-             strstr(buff, "UNKNOWN COMMAND") != NULL) {
-    char *err = buff, *errend;
+  } else if (strstr(line, "ERROR\n") != NULL ||
+             strstr(line, "UNKNOWN COMMAND") != NULL) {
+    char *err = line, *errend;
 
     errend = strstr(err, " ERROR");
     if (errend) {
@@ -334,6 +386,7 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
 
     pr_trace_msg("clamav", 1, "Clamd scanner was not able to function; please check that Clamd is functioning before filing a bug report.");
   }
+  free(line);
   fclose(fd);
   return infected ? infected : (waserror ? -1 : 0);
 }
