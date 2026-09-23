@@ -31,6 +31,7 @@
 #include "privs.h"
 #include <fcntl.h>
 #include <libgen.h>
+#include <stdint.h>
 #include <netdb.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -479,7 +480,7 @@ static int clamavd_connect_check(int sockd) {
  */
 static int clamavd_scan_stream(int sockd, const char *abs_filename,
                                const char *rel_filename) {
-  u_int32_t len = 0;
+  uint32_t len = 0;
   char *buf;
   size_t bufsz = 4096;
   size_t res;
