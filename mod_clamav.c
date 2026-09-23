@@ -115,7 +115,6 @@ static int set_socket_io_timeout(int sockd) {
 static int connect_with_timeout(int sockd, const struct sockaddr *sa,
     socklen_t sa_len, int timeout_secs) {
   fd_set wfds;
-  struct timeval tv;
   int flags, res, xerrno, so_error;
   socklen_t so_error_len;
 
@@ -133,13 +132,41 @@ static int connect_with_timeout(int sockd, const struct sockaddr *sa,
   } while (res < 0 && errno == EINTR);
 
   if (res < 0 && errno == EINPROGRESS) {
-    do {
-      FD_ZERO(&wfds);
-      FD_SET(sockd, &wfds);
-      tv.tv_sec = timeout_secs;
-      tv.tv_usec = 0;
-      res = select(sockd + 1, NULL, &wfds, NULL, &tv);
-    } while (res < 0 && errno == EINTR);
+    struct timeval deadline;
+
+    if (sockd >= FD_SETSIZE) {
+      errno = EMFILE;
+      res = -1;
+    } else {
+      if (gettimeofday(&deadline, NULL) < 0) {
+        deadline.tv_sec = 0;
+        deadline.tv_usec = 0;
+      }
+      deadline.tv_sec += timeout_secs;
+
+      do {
+        struct timeval now, remaining;
+
+        FD_ZERO(&wfds);
+        FD_SET(sockd, &wfds);
+        if (gettimeofday(&now, NULL) < 0) {
+          remaining.tv_sec = timeout_secs;
+          remaining.tv_usec = 0;
+        } else {
+          remaining.tv_sec = deadline.tv_sec - now.tv_sec;
+          remaining.tv_usec = deadline.tv_usec - now.tv_usec;
+          if (remaining.tv_usec < 0) {
+            remaining.tv_usec += 1000000;
+            remaining.tv_sec--;
+          }
+          if (remaining.tv_sec < 0) {
+            remaining.tv_sec = 0;
+            remaining.tv_usec = 0;
+          }
+        }
+        res = select(sockd + 1, NULL, &wfds, NULL, &remaining);
+      } while (res < 0 && errno == EINTR);
+    }
 
     if (res == 0) {
       errno = ETIMEDOUT;
