@@ -1,4 +1,6 @@
-PROFTPD_PREFIX ?= /home/jbenden/src/proftpd-1.3.5a
+# Path to a ProFTPD source tree (must contain configure, contrib/ and
+# tests/t/lib). Override on the command line, e.g. `make PROFTPD_PREFIX=...`
+PROFTPD_PREFIX ?= /usr/local/src/proftpd
 PROFTPD_TEST_BIN = $(PROFTPD_PREFIX)/proftpd
 MODCLAMAV_T = t/modules/mod_clamav.t
 CP = cp
@@ -23,4 +25,4 @@ build: $(PROFTPD_PREFIX)/configure copy
 clean:
 	rm -f build copy tests.log
 
-.PHONY: clean all
+.PHONY: all tests copy build clean
