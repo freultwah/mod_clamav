@@ -874,10 +874,13 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
     }
 
     if (session.chroot_path != NULL &&
-        strcmp(session.chroot_path, "/") != 0 &&
-        strncmp(abs_path, session.chroot_path,
-          strlen(session.chroot_path)) != 0) {
-      abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
+        strcmp(session.chroot_path, "/") != 0) {
+      size_t chroot_len = strlen(session.chroot_path);
+
+      if (strncmp(abs_path, session.chroot_path, chroot_len) != 0 ||
+          (abs_path[chroot_len] != '\0' && abs_path[chroot_len] != '/')) {
+        abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
+      }
     }
   }
 
