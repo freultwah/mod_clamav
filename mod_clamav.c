@@ -733,6 +733,10 @@ static int clamavd_connect(void) {
 
   memset((char*)&server, 0, sizeof(server));
 
+  /* Derive the transport from the current configuration on every connect so
+   * that a session moving between directories with different scanner
+   * settings does not reuse a stale mode (e.g. passing a Unix socket path to
+   * getaddrinfo() after previously using ClamServer). */
   clamd_host = (char *) get_param_ptr(CURRENT_CONF, "ClamLocalSocket", TRUE);
   if (!clamd_host) {
     clamd_host = (char *) get_param_ptr(CURRENT_CONF, "ClamServer", TRUE);
@@ -749,6 +753,7 @@ static int clamavd_connect(void) {
 
     (void) pr_trace_msg("clamav", 4, "Connecting to remote ClamAV scanner on host '%s' and port %d.", clamd_host, clamd_port);
   } else {
+    is_remote = 0;
     (void) pr_trace_msg("clamav", 4, "Connecting to local ClamAV scanner on unix socket '%s'.", clamd_host);
   }
 
