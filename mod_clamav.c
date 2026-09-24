@@ -990,12 +990,22 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
   }
   if (res < 0) {
     if (remove_on_failure) {
-      pr_log_debug(DEBUG4,
-                   MOD_CLAMAV_VERSION ": removing failed upload of filename = '%s' with relative filename = '%s'.", abs_path, rel_path);
-      if (pr_fsio_unlink(rel_path) != 0) {
-        pr_log_pri(PR_LOG_ERR,
-                   MOD_CLAMAV_VERSION ": notice    : unlink() failed (%d): %s",
-                   errno, strerror(errno));
+      /* Never delete the destination file for APPE: the append targeted an
+       * existing file, so removing it on a scan failure would destroy the
+       * original contents as well as the appended data. Reject the append
+       * without unlinking. */
+      if (session.curr_cmd == NULL ||
+          strcmp(session.curr_cmd, C_APPE) != 0) {
+        pr_log_debug(DEBUG4,
+                     MOD_CLAMAV_VERSION ": removing failed upload of filename = '%s' with relative filename = '%s'.", abs_path, rel_path);
+        if (pr_fsio_unlink(rel_path) != 0) {
+          pr_log_pri(PR_LOG_ERR,
+                     MOD_CLAMAV_VERSION ": notice    : unlink() failed (%d): %s",
+                     errno, strerror(errno));
+        }
+      } else {
+        pr_log_debug(DEBUG4,
+                     MOD_CLAMAV_VERSION ": not removing APPE destination '%s' after failed scan.", rel_path);
       }
       errno = EPERM;
       return -1;
