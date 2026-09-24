@@ -72,7 +72,8 @@ static int connect_with_timeout(int sockd, const struct sockaddr *sa,
   socklen_t sa_len, int timeout_secs);
 static int clamav_path_is_hiddenstore(const char *path);
 static int clamav_hiddenstores_enabled(void);
-static char *clamav_read_response_line(FILE *fd);
+static int clamav_response_is_ok(const char *line);
+static char *clamav_read_response_line(FILE *fd, int *complete);
 
 static int write_all(int fd, const void *buf, size_t len) {
   const unsigned char *ptr = (const unsigned char *) buf;
@@ -233,25 +234,51 @@ static int clamav_hiddenstores_enabled(void) {
 }
 
 /**
+ * Return TRUE if a complete Clamavd response line reports a clean scan,
+ * i.e. its status (the text after the final colon) is exactly "OK".
+ */
+static int clamav_response_is_ok(const char *line) {
+  const char *colon = strrchr(line, ':');
+
+  if (colon == NULL) {
+    return FALSE;
+  }
+
+  return strncmp(colon + 1, " OK\n", 4) == 0;
+}
+
+/**
  * Read a full response line from Clamavd, growing the buffer as needed so
  * that long lines (e.g. a SCAN response echoing a long file path) are not
  * truncated. Returns a NUL-terminated malloc'ed string, or NULL on error
  * (with errno set).
+ *
+ * If complete is non-NULL, *complete is set to TRUE when the line was
+ * terminated by a newline, or FALSE when the stream ended (EOF or read
+ * error) before a newline was seen. A response containing an embedded NUL
+ * byte is malformed and rejected (returns NULL with errno set to EPROTO).
  */
-static char *clamav_read_response_line(FILE *fd) {
+static char *clamav_read_response_line(FILE *fd, int *complete) {
   size_t cap = 4096, len = 0;
+  int c;
   char *buf;
+
+  if (complete != NULL) {
+    *complete = FALSE;
+  }
 
   buf = malloc(cap);
   if (buf == NULL) {
     return NULL;
   }
 
+  /* Read one byte at a time so we track the exact byte count and can reject
+   * an embedded NUL anywhere in the line. fgets() cannot be used here: it
+   * does not stop at an embedded NUL, so a NUL after a nonempty prefix would
+   * let the following line be spliced onto the prefix (e.g. "stream: \0...
+   * FOUND\nOK\n" collapsing into "stream: OK\n"). */
   for (;;) {
-    char *resptr;
-    int fxerrno;
-
-    if (cap - len < 2) {
+    if (len + 1 >= cap) {
       char *nb;
 
       cap *= 2;
@@ -265,36 +292,46 @@ static char *clamav_read_response_line(FILE *fd) {
 
     errno = 0;
     pr_signals_handle();
-    resptr = fgets(buf + len, (int) (cap - len), fd);
-    fxerrno = errno;
+    c = fgetc(fd);
 
-    if (resptr == NULL) {
-      if (fxerrno == EINTR) {
+    if (c == EOF) {
+      if (errno == EINTR) {
         continue;
       }
       if (len == 0) {
         free(buf);
-        errno = (fxerrno == 0) ? EIO : fxerrno;
+        errno = EIO;
         return NULL;
       }
-      break;
+      /* Stream ended without a terminating newline: incomplete response. */
+      buf[len] = '\0';
+      return buf;
     }
 
-    len += strlen(resptr);
-    if (buf[len - 1] == '\n') {
-      break;
+    if (c == '\0') {
+      /* Embedded NUL: malformed scanner response. */
+      free(buf);
+      errno = EPROTO;
+      return NULL;
+    }
+
+    buf[len++] = (char) c;
+
+    if (c == '\n') {
+      if (complete != NULL) {
+        *complete = TRUE;
+      }
+      buf[len] = '\0';
+      return buf;
     }
   }
-
-  buf[len] = '\0';
-  return buf;
 }
 
 /**
  * Read the returned information from Clamavd.
  */
 static int clamavd_result(int sockd, const char *abs_filename, const char *rel_filename) {
-  int infected = 0, waserror = 0, ret;
+  int infected = 0, waserror = 0, ret, complete = FALSE;
   char *line = NULL, *pt, *pt1;
   FILE *fd = 0;
   int fddup = -1;
@@ -317,7 +354,7 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     return -1;
   }
 
-  line = clamav_read_response_line(fd);
+  line = clamav_read_response_line(fd, &complete);
   if (line == NULL) {
     int fxerrno = errno;
 
@@ -333,7 +370,14 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     return -1;
   }
 
-  if (strstr(line, "FOUND\n")) {
+  if (complete == FALSE) {
+    /* A truncated reply (no terminating newline) must not be treated as a
+     * clean scan; fail closed so ClamFailsafe can act on it. */
+    pr_log_pri(PR_LOG_ERR,
+               MOD_CLAMAV_VERSION ": error: incomplete scan result for '%s': '%s'",
+               abs_filename, line);
+    waserror = 1;
+  } else if (strstr(line, "FOUND\n") != NULL) {
     const char *proto;
     int do_unlink = TRUE;
 
@@ -413,6 +457,13 @@ static int clamavd_result(int sockd, const char *abs_filename, const char *rel_f
     waserror = 1;
 
     pr_trace_msg("clamav", 1, "Clamd scanner was not able to function; please check that Clamd is functioning before filing a bug report.");
+  } else if (clamav_response_is_ok(line) == FALSE) {
+    /* A complete reply that is neither OK, FOUND, nor a recognized error is
+     * not a confirmed clean scan; fail closed rather than assume it is. */
+    pr_log_pri(PR_LOG_ERR,
+               MOD_CLAMAV_VERSION ": error: unrecognized scan result for '%s': '%s'",
+               abs_filename, line);
+    waserror = 1;
   }
   free(line);
   fclose(fd);
