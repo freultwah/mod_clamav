@@ -8,7 +8,8 @@
  * Build and run (AddressSanitizer + UndefinedBehaviorSanitizer):
  *
  *   cc -std=c11 -g -Wall -fsanitize=address,undefined \
- *      -I t/unit -o t/unit/test_response_reader t/unit/test_response_reader.c
+ *      -I t/unit -I . -o t/unit/test_response_reader \
+ *      t/unit/test_response_reader.c
  *   ./t/unit/test_response_reader
  */
 #include "conf.h"
