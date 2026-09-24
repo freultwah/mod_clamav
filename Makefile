@@ -17,9 +17,9 @@ copy: $(PROFTPD_PREFIX)/contrib mod_clamav.h mod_clamav.c
 	touch $@
 
 build: $(PROFTPD_PREFIX)/configure copy
-	( cd $(PROFTPD_PREFIX); \
-	./configure --with-modules=mod_clamav:mod_vroot; \
-	$(MAKE); ); \
+	( cd $(PROFTPD_PREFIX) && \
+	./configure --with-modules=mod_clamav:mod_vroot && \
+	$(MAKE) ) && \
 	touch $@
 
 clean:
