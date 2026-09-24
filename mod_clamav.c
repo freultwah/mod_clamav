@@ -925,18 +925,22 @@ static int clamav_fsio_close(pr_fh_t *fh, int fd) {
   rel_path = pstrdup(fh->fh_pool, fh->fh_path);
   abs_path = rel_path;
   if (abs_path != NULL) {
+    /* Make the path absolute within the session's (possibly jailed)
+     * filesystem namespace. The ordinary filesystem implementation keeps the
+     * supplied pathname in fh_path and does not prepend the host-side jail
+     * path, so a textual prefix match cannot tell us whether the jail root is
+     * already included.
+     */
     if (*abs_path != '/') {
       abs_path = pdircat(fh->fh_pool, pr_fs_getcwd(), abs_path, NULL);
     }
 
+    /* Map the in-namespace absolute path to the host-side path that ClamAV
+     * (running outside the jail) can actually open, by prepending the jail
+     * root whenever the session is chrooted. */
     if (session.chroot_path != NULL &&
         strcmp(session.chroot_path, "/") != 0) {
-      size_t chroot_len = strlen(session.chroot_path);
-
-      if (strncmp(abs_path, session.chroot_path, chroot_len) != 0 ||
-          (abs_path[chroot_len] != '\0' && abs_path[chroot_len] != '/')) {
-        abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
-      }
+      abs_path = pdircat(fh->fh_pool, session.chroot_path, abs_path, NULL);
     }
   }
 
